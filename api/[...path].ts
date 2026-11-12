@@ -2,17 +2,22 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { Telegraf, Markup } from 'telegraf';
 import { Redis } from '@upstash/redis';
 
-// Initialize Redis with fallback for Vercel KV vs Upstash
-let redis: Redis;
-try {
-  redis = Redis.fromEnv();
-} catch (e) {
-  redis = new Redis({
-    url: process.env.KV_REST_API_URL || '',
-    token: process.env.KV_REST_API_TOKEN || '',
-  });
+// ─── LAZY DATABASE CONNECTION ────────────────────────────────────────
+// This prevents the app from crashing if the database env variables are missing.
+let _redis: Redis | null = null;
+function getRedis(): Redis {
+  if (_redis) return _redis;
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+  
+  if (!url || !token) {
+    throw new Error("DATABASE_MISSING: Go to Vercel -> Storage -> Connect Upstash Redis.");
+  }
+  _redis = new Redis({ url, token });
+  return _redis;
 }
 
+// ─── TYPES ───────────────────────────────────────────────────────────
 interface Plan { label: string; price: string; days: number; }
 interface BotConfig {
   BOT_API_TOKEN: string; ADMIN_ID: string; DEV_ID: string;
@@ -38,20 +43,24 @@ const DEFAULT_CONFIG: BotConfig = {
   ],
 };
 
+// ─── STORES ──────────────────────────────────────────────────────────
 async function getConfig(): Promise<BotConfig> {
   try {
-    const stored = await redis.get<Partial<BotConfig>>('bot:config');
+    const stored = await getRedis().get<Partial<BotConfig>>('bot:config');
     return { ...DEFAULT_CONFIG, ...(stored || {}) };
-  } catch (e) { return DEFAULT_CONFIG; }
+  } catch (e: any) { 
+    console.error("getConfig error:", e.message);
+    return DEFAULT_CONFIG; 
+  }
 }
 
-async function saveConfig(c: BotConfig) { await redis.set('bot:config', c); }
+async function saveConfig(c: BotConfig) { await getRedis().set('bot:config', c); }
 
 async function getUsers(): Promise<Record<string, string>> {
-  try { return (await redis.get<Record<string, string>>('bot:users')) || {}; } 
+  try { return (await getRedis().get<Record<string, string>>('bot:users')) || {}; } 
   catch (e) { return {}; }
 }
-async function setUsers(u: Record<string, string>) { await redis.set('bot:users', u); }
+async function setUsers(u: Record<string, string>) { await getRedis().set('bot:users', u); }
 
 async function isSubscribed(username: string): Promise<boolean> {
   const users = await getUsers();
@@ -72,15 +81,16 @@ function listUsers(users: Record<string, string>): string {
 
 async function pushLog(text: string, level: LogEntry['level'] = 'info') {
   const entry: LogEntry = { id: Date.now() + Math.floor(Math.random() * 1000), time: new Date().toISOString().slice(11, 19), level, text: text.trimEnd() };
-  try { await redis.lpush('bot:logs', JSON.stringify(entry)); await redis.ltrim('bot:logs', 0, 199); } catch(e) {}
+  try { await getRedis().lpush('bot:logs', JSON.stringify(entry)); await getRedis().ltrim('bot:logs', 0, 199); } catch(e) {}
 }
 
 async function getLogs(limit = 200): Promise<LogEntry[]> {
-  try { const raw = (await redis.lrange('bot:logs', 0, Math.max(0, limit - 1))) || []; return raw.map(s => (typeof s === 'string' ? JSON.parse(s) : s)); } catch(e) { return []; }
+  try { const raw = (await getRedis().lrange('bot:logs', 0, Math.max(0, limit - 1))) || []; return raw.map(s => (typeof s === 'string' ? JSON.parse(s) : s)); } catch(e) { return []; }
 }
 
-async function clearLogs() { try { await redis.del('bot:logs'); } catch(e){} }
+async function clearLogs() { try { await getRedis().del('bot:logs'); } catch(e){} }
 
+// ─── WINGO SCRAPER ───────────────────────────────────────────────────
 const WINGO_URL = 'https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500';
 
 async function fetchWingoHistory(): Promise<WingoRecord[]> {
@@ -129,6 +139,7 @@ function formatTrend(records: WingoRecord[], limit = 10): string {
   return m;
 }
 
+// ─── TELEGRAM BOT LOGIC ──────────────────────────────────────────────
 function isAdmin(c: BotConfig, chatId: number | string): boolean {
   const id = String(chatId);
   return id !== '0' && (id === String(c.ADMIN_ID) || id === String(c.DEV_ID));
@@ -237,6 +248,7 @@ async function createBot(config: BotConfig): Promise<Telegraf> {
 function cleanHandle(s: string): string { return String(s || '').replace(/^(https?:\/\/)?(t\.me\/|telegram\.me\/)/, '').replace(/^@/, '').trim(); }
 function getBaseUrl(req: VercelRequest): string { const h = ((req.headers['x-forwarded-host'] as string) || (req.headers.host as string) || '').split(',')[0].trim(); return h ? `https://${h}` : ''; }
 
+// ─── INLINE ADMIN DASHBOARD (HTML) ───────────────────────────────────
 const ADMIN_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -401,16 +413,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const config = await getConfig();
       const isConfigured = Boolean(config.BOT_API_TOKEN && config.BOT_API_TOKEN.length > 15);
       let webhookUrl: string | null = null;
-      if (isConfigured) {
-        try { const r = await fetch(\`https://api.telegram.org/bot\${config.BOT_API_TOKEN}/getWebhookInfo\`); const d: any = await r.json(); webhookUrl = d?.result?.url || null; } catch {}
+      let dbError = null;
+      
+      try {
+        await getRedis().ping();
+      } catch(e: any) {
+        dbError = e.message;
       }
-      return res.json({ status: webhookUrl ? 'running' : isConfigured ? 'starting' : 'waiting_token', isConfigured, botName: config.BOT_NAME, adminUsername: config.ADMIN_USERNAME, botGroupLink: config.BOT_GROUP_LINK, webhookUrl });
+
+      if (isConfigured && !dbError) {
+        try { const r = await fetch(`https://api.telegram.org/bot${config.BOT_API_TOKEN}/getWebhookInfo`); const d: any = await r.json(); webhookUrl = d?.result?.url || null; } catch {}
+      }
+      
+      return res.json({ 
+        status: dbError ? 'error' : webhookUrl ? 'running' : isConfigured ? 'starting' : 'waiting_token', 
+        dbError,
+        isConfigured, 
+        botName: config.BOT_NAME, 
+        adminUsername: config.ADMIN_USERNAME, 
+        botGroupLink: config.BOT_GROUP_LINK, 
+        webhookUrl 
+      });
     }
 
     if (route === 'config') {
       if (req.method === 'GET') {
         const c = await getConfig();
-        const tokenPreview = c.BOT_API_TOKEN ? \`\${c.BOT_API_TOKEN.slice(0, 6)}...\${c.BOT_API_TOKEN.slice(-4)}\` : '';
+        const tokenPreview = c.BOT_API_TOKEN ? `${c.BOT_API_TOKEN.slice(0, 6)}...${c.BOT_API_TOKEN.slice(-4)}` : '';
         return res.json({ ...c, tokenPreview });
       }
       if (req.method === 'POST') {
@@ -420,13 +449,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         await saveConfig(updated);
         await pushLog('Bot configuration updated from Web Dashboard.', 'success');
         if (updated.BOT_API_TOKEN) {
-          const webhookUrl = \`\${getBaseUrl(req)}/api/webhook\`;
+          const webhookUrl = `${getBaseUrl(req)}/api/webhook`;
           try {
-            const resp = await fetch(\`https://api.telegram.org/bot\${updated.BOT_API_TOKEN}/setWebhook\`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: webhookUrl }) });
+            const resp = await fetch(`https://api.telegram.org/bot${updated.BOT_API_TOKEN}/setWebhook`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: webhookUrl }) });
             const result: any = await resp.json();
-            if (result.ok) await pushLog(\`Webhook registered: \${webhookUrl}\`, 'success');
-            else await pushLog(\`setWebhook failed: \${result.description}\`, 'error');
-          } catch (e: any) { await pushLog(\`setWebhook error: \${e.message}\`, 'error'); }
+            if (result.ok) await pushLog(`Webhook registered: ${webhookUrl}`, 'success');
+            else await pushLog(`setWebhook failed: ${result.description}`, 'error');
+          } catch (e: any) { await pushLog(`setWebhook error: ${e.message}`, 'error'); }
         }
         return res.json({ success: true, config: updated });
       }
@@ -448,7 +477,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const exp = new Date(); exp.setDate(exp.getDate() + numDays);
       const expStr = exp.toISOString().split('T')[0];
       const users = await getUsers(); users[cleanUser] = expStr; await setUsers(users);
-      await pushLog(\`VIP Manager: added @\${cleanUser} for \${numDays} days\`, 'success');
+      await pushLog(`VIP Manager: added @${cleanUser} for ${numDays} days`, 'success');
       return res.json({ success: true, username: cleanUser, expiration: expStr });
     }
 
@@ -457,7 +486,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!username) return res.status(400).json({ error: 'username required' });
       const cleanUser = String(username).toLowerCase().replace(/^@/, '').trim();
       const users = await getUsers(); delete users[cleanUser]; await setUsers(users);
-      await pushLog(\`VIP Manager: removed @\${cleanUser}\`, 'info');
+      await pushLog(`VIP Manager: removed @${cleanUser}`, 'info');
       return res.json({ success: true });
     }
 
@@ -471,7 +500,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const config = await getConfig();
       const token = (req.query.token as string) || config.BOT_API_TOKEN;
       if (!token || !token.includes(':')) return res.status(400).json({ valid: false, message: 'Invalid token' });
-      const r = await fetch(\`https://api.telegram.org/bot\${token}/getMe\`);
+      const r = await fetch(`https://api.telegram.org/bot${token}/getMe`);
       const d: any = await r.json();
       return d.ok ? res.json({ valid: true, bot: d.result }) : res.json({ valid: false, error: d.description });
     }
@@ -483,7 +512,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.json({ total: records.length, latest: records[0] || null, prediction, records: records.slice(0, 50) });
     }
 
-    return res.status(404).json({ error: \`Unknown route: /api/\${route}\` });
+    return res.status(404).json({ error: `Unknown route: /api/${route}` });
   } catch (e: any) {
     console.error('[api]', e);
     return res.status(500).json({ error: e.message });
