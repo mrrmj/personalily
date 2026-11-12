@@ -3,7 +3,6 @@ import { Telegraf, Markup } from 'telegraf';
 import { Redis } from '@upstash/redis';
 
 // ─── LAZY DATABASE CONNECTION ────────────────────────────────────────
-// This prevents the app from crashing if the database env variables are missing.
 let _redis: Redis | null = null;
 function getRedis(): Redis {
   if (_redis) return _redis;
@@ -48,10 +47,7 @@ async function getConfig(): Promise<BotConfig> {
   try {
     const stored = await getRedis().get<Partial<BotConfig>>('bot:config');
     return { ...DEFAULT_CONFIG, ...(stored || {}) };
-  } catch (e: any) { 
-    console.error("getConfig error:", e.message);
-    return DEFAULT_CONFIG; 
-  }
+  } catch (e: any) { return DEFAULT_CONFIG; }
 }
 
 async function saveConfig(c: BotConfig) { await getRedis().set('bot:config', c); }
@@ -311,7 +307,7 @@ async function refresh() {
     const text = await res.text();
     
     if (!res.ok) {
-      statusDiv.innerHTML = \`<div class="text-red-500 font-bold p-2 bg-red-900/20 rounded border border-red-900/50">API Error (\${res.status}):<br><pre class="text-xs mt-1 whitespace-pre-wrap">\${text}</pre></div>\`;
+      statusDiv.innerHTML = '<div class="text-red-500 font-bold p-2 bg-red-900/20 rounded border border-red-900/50">API Error (' + res.status + '):<br><pre class="text-xs mt-1 whitespace-pre-wrap">' + text + '</pre></div>';
       return;
     }
     
@@ -319,37 +315,42 @@ async function refresh() {
     try { s = JSON.parse(text); } catch(e) { throw new Error("Invalid JSON from server"); }
     
     const color = s.status === 'running' ? 'text-green-400' : s.status === 'waiting_token' ? 'text-yellow-400' : 'text-red-400';
-    statusDiv.innerHTML = \`<div class="flex items-center gap-3">
-        <span class="text-2xl">\${s.status === 'running' ? '🟢' : s.status === 'waiting_token' ? '🟡' : '🔴'}</span>
-        <div>
-          <div class="font-semibold \${color}">Status: \${s.status ? s.status.toUpperCase() : 'UNKNOWN'}</div>
-          <div class="text-xs text-slate-400">Bot: \${s.botName || '—'} · Channel: @\${s.botGroupLink || '—'} · Webhook: \${s.webhookUrl || 'not registered'}</div>
-        </div>
-      </div>\`;
+    statusDiv.innerHTML = '<div class="flex items-center gap-3">' +
+        '<span class="text-2xl">' + (s.status === 'running' ? '🟢' : s.status === 'waiting_token' ? '🟡' : '🔴') + '</span>' +
+        '<div>' +
+          '<div class="font-semibold ' + color + '">Status: ' + (s.status ? s.status.toUpperCase() : 'UNKNOWN') + '</div>' +
+          '<div class="text-xs text-slate-400">Bot: ' + (s.botName || '—') + ' · Channel: @' + (s.botGroupLink || '—') + ' · Webhook: ' + (s.webhookUrl || 'not registered') + '</div>' +
+        '</div>' +
+      '</div>';
 
     const cRes = await fetch('/api/config');
     const c = await cRes.json();
     const form = document.getElementById('cfgForm');
-    FIELDS.forEach(k => { if (form[k]) form[k].value = c[k] || ''; });
+    FIELDS.forEach(function(k) { if (form[k]) form[k].value = c[k] || ''; });
 
     const uRes = await fetch('/api/users');
     const u = await uRes.json();
     document.getElementById('users').innerHTML = (u.users && u.users.length)
-      ? u.users.map(x => \`<div class="flex justify-between items-center py-1 border-b border-slate-800">
-          <span>@\${x.username} · expires \${x.expiration} (\${x.daysLeft}d)</span>
-          <button onclick="removeUser('\${x.username}')" class="text-red-400 hover:text-red-300 text-sm">Remove</button>
-        </div>\`).join('')
+      ? u.users.map(function(x) { 
+          return '<div class="flex justify-between items-center py-1 border-b border-slate-800">' +
+            '<span>@' + x.username + ' · expires ' + x.expiration + ' (' + x.daysLeft + 'd)</span>' +
+            '<button onclick="removeUser(\'' + x.username + '\')" class="text-red-400 hover:text-red-300 text-sm">Remove</button>' +
+          '</div>';
+        }).join('')
       : '<div class="text-slate-500">No VIP users yet</div>';
 
     const lRes = await fetch('/api/logs?limit=50');
     const l = await lRes.json();
     document.getElementById('logs').innerHTML = (l.logs && l.logs.length)
-      ? l.logs.slice().reverse().map(e => \`<div class="\${e.level === 'error' ? 'text-red-400' : e.level === 'success' ? 'text-green-400' : e.level === 'warn' ? 'text-yellow-400' : 'text-slate-300'}">
-        <span class="text-slate-500">[\${e.time}]</span> \${e.text}
-      </div>\`).join('')
+      ? l.logs.slice().reverse().map(function(e) {
+          const lvlColor = e.level === 'error' ? 'text-red-400' : e.level === 'success' ? 'text-green-400' : e.level === 'warn' ? 'text-yellow-400' : 'text-slate-300';
+          return '<div class="' + lvlColor + '">' +
+            '<span class="text-slate-500">[' + e.time + ']</span> ' + e.text +
+          '</div>';
+        }).join('')
       : '<div class="text-slate-500">No logs yet</div>';
   } catch (e) {
-    statusDiv.innerHTML = \`<div class="text-red-500 font-bold p-2 bg-red-900/20 rounded border border-red-900/50">Network Error: \${e.message}</div>\`;
+    statusDiv.innerHTML = '<div class="text-red-500 font-bold p-2 bg-red-900/20 rounded border border-red-900/50">Network Error: ' + e.message + '</div>';
   }
 }
 
@@ -359,7 +360,7 @@ document.getElementById('cfgForm').onsubmit = async (e) => {
   btn.innerText = 'Saving...';
   try {
     const data = {};
-    FIELDS.forEach(k => { data[k] = e.target[k].value; });
+    FIELDS.forEach(function(k) { data[k] = e.target[k].value; });
     const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
     const j = await r.json();
     alert(j.success ? 'Saved! Webhook registered. Bot is now live.' : 'Error: ' + (j.error || 'unknown'));
