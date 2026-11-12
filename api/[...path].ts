@@ -16,6 +16,14 @@ function getRedis(): Redis {
   return _redis;
 }
 
+// Prevent the app from hanging forever if the DB is down
+function withTimeout<T>(promise: Promise<T>, ms = 4000): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("DB_TIMEOUT: Database took too long to respond.")), ms))
+  ]);
+}
+
 // ─── TYPES ───────────────────────────────────────────────────────────
 interface Plan { label: string; price: string; days: number; }
 interface BotConfig {
@@ -45,18 +53,22 @@ const DEFAULT_CONFIG: BotConfig = {
 // ─── STORES ──────────────────────────────────────────────────────────
 async function getConfig(): Promise<BotConfig> {
   try {
-    const stored = await getRedis().get<Partial<BotConfig>>('bot:config');
+    const stored = await withTimeout(getRedis().get<Partial<BotConfig>>('bot:config'));
     return { ...DEFAULT_CONFIG, ...(stored || {}) };
   } catch (e: any) { return DEFAULT_CONFIG; }
 }
 
-async function saveConfig(c: BotConfig) { await getRedis().set('bot:config', c); }
+async function saveConfig(c: BotConfig) { 
+  await withTimeout(getRedis().set('bot:config', c)); 
+}
 
 async function getUsers(): Promise<Record<string, string>> {
-  try { return (await getRedis().get<Record<string, string>>('bot:users')) || {}; } 
+  try { return (await withTimeout(getRedis().get<Record<string, string>>('bot:users'))) || {}; } 
   catch (e) { return {}; }
 }
-async function setUsers(u: Record<string, string>) { await getRedis().set('bot:users', u); }
+async function setUsers(u: Record<string, string>) { 
+  await withTimeout(getRedis().set('bot:users', u)); 
+}
 
 async function isSubscribed(username: string): Promise<boolean> {
   const users = await getUsers();
@@ -77,14 +89,14 @@ function listUsers(users: Record<string, string>): string {
 
 async function pushLog(text: string, level: LogEntry['level'] = 'info') {
   const entry: LogEntry = { id: Date.now() + Math.floor(Math.random() * 1000), time: new Date().toISOString().slice(11, 19), level, text: text.trimEnd() };
-  try { await getRedis().lpush('bot:logs', JSON.stringify(entry)); await getRedis().ltrim('bot:logs', 0, 199); } catch(e) {}
+  try { await withTimeout(getRedis().lpush('bot:logs', JSON.stringify(entry))); await withTimeout(getRedis().ltrim('bot:logs', 0, 199)); } catch(e) {}
 }
 
 async function getLogs(limit = 200): Promise<LogEntry[]> {
-  try { const raw = (await getRedis().lrange('bot:logs', 0, Math.max(0, limit - 1))) || []; return raw.map(s => (typeof s === 'string' ? JSON.parse(s) : s)); } catch(e) { return []; }
+  try { const raw = (await withTimeout(getRedis().lrange('bot:logs', 0, Math.max(0, limit - 1)))) || []; return raw.map(s => (typeof s === 'string' ? JSON.parse(s) : s)); } catch(e) { return []; }
 }
 
-async function clearLogs() { try { await getRedis().del('bot:logs'); } catch(e){} }
+async function clearLogs() { try { await withTimeout(getRedis().del('bot:logs')); } catch(e){} }
 
 // ─── WINGO SCRAPER ───────────────────────────────────────────────────
 const WINGO_URL = 'https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500';
@@ -260,6 +272,8 @@ const ADMIN_HTML = `<!DOCTYPE html>
   <div id="status" class="mb-6 p-4 bg-slate-900 border border-slate-800 rounded-lg">
     <div class="text-slate-400 text-sm">Loading status…</div>
   </div>
+  
+  <div id="error-box" class="hidden mb-6 p-4 bg-red-900/20 border border-red-900/50 rounded-lg text-red-400"></div>
 
   <section class="mb-6">
     <h2 class="text-xl font-semibold mb-2">⚙️ Configuration</h2>
@@ -274,7 +288,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <input name="ADMIN_USERNAME" placeholder="Admin Username (no @)" class="p-2 bg-slate-800 rounded border border-slate-700">
         <input name="BOT_GROUP_LINK" placeholder="Channel Username (no @)" class="p-2 bg-slate-800 rounded border border-slate-700">
       </div>
-      <button type="submit" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-semibold">💾 Save & Register Webhook</button>
+      <button type="button" id="saveBtn" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-semibold">💾 Save & Register Webhook</button>
     </form>
   </section>
 
@@ -299,15 +313,36 @@ const ADMIN_HTML = `<!DOCTYPE html>
 
 <script>
 const FIELDS = ['BOT_API_TOKEN','ADMIN_ID','DEV_ID','BOT_NAME','ADMIN_USERNAME','BOT_GROUP_LINK'];
+const errorBox = document.getElementById('error-box');
+
+function showError(msg) {
+  errorBox.classList.remove('hidden');
+  errorBox.innerHTML = '<b>Error:</b> ' + msg;
+}
+
+async function fetchWithTimeout(resource, options = {}) {
+  const { timeout = 5000 } = options;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(resource, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return response;
+  } catch (error) {
+    clearTimeout(id);
+    if (error.name === 'AbortError') throw new Error("Request timed out. Database might be missing.");
+    throw error;
+  }
+}
 
 async function refresh() {
   const statusDiv = document.getElementById('status');
   try {
-    const res = await fetch('/api/status');
+    const res = await fetchWithTimeout('/api/status');
     const text = await res.text();
     
     if (!res.ok) {
-      statusDiv.innerHTML = '<div class="text-red-500 font-bold p-2 bg-red-900/20 rounded border border-red-900/50">API Error (' + res.status + '):<br><pre class="text-xs mt-1 whitespace-pre-wrap">' + text + '</pre></div>';
+      showError('API Error (' + res.status + '): ' + text);
       return;
     }
     
@@ -323,66 +358,76 @@ async function refresh() {
         '</div>' +
       '</div>';
 
-    const cRes = await fetch('/api/config');
+    const cRes = await fetchWithTimeout('/api/config');
     const c = await cRes.json();
     const form = document.getElementById('cfgForm');
     FIELDS.forEach(function(k) { if (form[k]) form[k].value = c[k] || ''; });
 
-    const uRes = await fetch('/api/users');
+    const uRes = await fetchWithTimeout('/api/users');
     const u = await uRes.json();
     document.getElementById('users').innerHTML = (u.users && u.users.length)
       ? u.users.map(function(x) { 
-          return '<div class="flex justify-between items-center py-1 border-b border-slate-800">' +
-            '<span>@' + x.username + ' · expires ' + x.expiration + ' (' + x.daysLeft + 'd)</span>' +
-            '<button onclick="removeUser(\'' + x.username + '\')" class="text-red-400 hover:text-red-300 text-sm">Remove</button>' +
-          '</div>';
+          return '<div class="flex justify-between items-center py-1 border-b border-slate-800"><span>@' + x.username + ' · expires ' + x.expiration + ' (' + x.daysLeft + 'd)</span><button onclick="removeUser(\'' + x.username + '\')" class="text-red-400 hover:text-red-300 text-sm">Remove</button></div>';
         }).join('')
       : '<div class="text-slate-500">No VIP users yet</div>';
 
-    const lRes = await fetch('/api/logs?limit=50');
+    const lRes = await fetchWithTimeout('/api/logs?limit=50');
     const l = await lRes.json();
     document.getElementById('logs').innerHTML = (l.logs && l.logs.length)
       ? l.logs.slice().reverse().map(function(e) {
           const lvlColor = e.level === 'error' ? 'text-red-400' : e.level === 'success' ? 'text-green-400' : e.level === 'warn' ? 'text-yellow-400' : 'text-slate-300';
-          return '<div class="' + lvlColor + '">' +
-            '<span class="text-slate-500">[' + e.time + ']</span> ' + e.text +
-          '</div>';
+          return '<div class="' + lvlColor + '"><span class="text-slate-500">[' + e.time + ']</span> ' + e.text + '</div>';
         }).join('')
       : '<div class="text-slate-500">No logs yet</div>';
   } catch (e) {
-    statusDiv.innerHTML = '<div class="text-red-500 font-bold p-2 bg-red-900/20 rounded border border-red-900/50">Network Error: ' + e.message + '</div>';
+    statusDiv.innerHTML = '<div class="text-red-500 font-bold">Failed to load status.</div>';
+    showError(e.message);
   }
 }
 
-document.getElementById('cfgForm').onsubmit = async (e) => {
-  e.preventDefault();
-  const btn = e.target.querySelector('button');
+document.getElementById('saveBtn').onclick = async () => {
+  const btn = document.getElementById('saveBtn');
+  const form = document.getElementById('cfgForm');
   btn.innerText = 'Saving...';
+  errorBox.classList.add('hidden');
+  
   try {
     const data = {};
-    FIELDS.forEach(function(k) { data[k] = e.target[k].value; });
-    const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    FIELDS.forEach(function(k) { data[k] = form[k].value; });
+    const r = await fetchWithTimeout('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
     const j = await r.json();
-    alert(j.success ? 'Saved! Webhook registered. Bot is now live.' : 'Error: ' + (j.error || 'unknown'));
-  } catch(e) { alert('Network Error: ' + e.message); }
+    if (j.success) {
+      alert('Saved! Webhook registered. Bot is now live.');
+    } else {
+      showError('Save failed: ' + (j.error || 'unknown'));
+    }
+  } catch(e) { showError(e.message); }
+  
   btn.innerText = '💾 Save & Register Webhook';
   refresh();
 };
 
 document.getElementById('addForm').onsubmit = async (e) => {
   e.preventDefault();
-  await fetch('/api/users/add', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username: e.target.username.value, days: e.target.days.value }) });
-  e.target.reset();
+  try {
+    await fetchWithTimeout('/api/users/add', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username: e.target.username.value, days: e.target.days.value }) });
+    e.target.reset();
+  } catch(e) { showError(e.message); }
   refresh();
 };
 
 async function removeUser(u) {
   if (!confirm('Remove @' + u + '?')) return;
-  await fetch('/api/users/remove', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username: u }) });
+  try {
+    await fetchWithTimeout('/api/users/remove', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username: u }) });
+  } catch(e) { showError(e.message); }
   refresh();
 }
 
-async function clearLogs() { await fetch('/api/logs', { method: 'POST' }); refresh(); }
+async function clearLogs() { 
+  try { await fetchWithTimeout('/api/logs', { method: 'POST' }); } catch(e) {}
+  refresh(); 
+}
 
 refresh();
 setInterval(refresh, 5000);
@@ -417,7 +462,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       let dbError = null;
       
       try {
-        await getRedis().ping();
+        await withTimeout(getRedis().ping());
       } catch(e: any) {
         dbError = e.message;
       }
