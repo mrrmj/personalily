@@ -1,15 +1,18 @@
-// =====================================================================
-// Visionary Bot — SINGLE FILE (all logic + inline admin dashboard)
-// =====================================================================
-
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { Telegraf, Markup } from 'telegraf';
 import { Redis } from '@upstash/redis';
 
-// Initialize the new Upstash Redis connection
-const redis = Redis.fromEnv();
+// Initialize Redis with fallback for Vercel KV vs Upstash
+let redis: Redis;
+try {
+  redis = Redis.fromEnv();
+} catch (e) {
+  redis = new Redis({
+    url: process.env.KV_REST_API_URL || '',
+    token: process.env.KV_REST_API_TOKEN || '',
+  });
+}
 
-// ─── TYPES ───────────────────────────────────────────────────────────
 interface Plan { label: string; price: string; days: number; }
 interface BotConfig {
   BOT_API_TOKEN: string; ADMIN_ID: string; DEV_ID: string;
@@ -24,7 +27,6 @@ interface LogEntry {
   level: 'info' | 'warn' | 'error' | 'success'; text: string;
 }
 
-// ─── CONFIG STORE ────────────────────────────────────────────────────
 const DEFAULT_CONFIG: BotConfig = {
   BOT_API_TOKEN: '', ADMIN_ID: '0', DEV_ID: '0',
   BOT_NAME: 'Visionary Bot', ADMIN_USERNAME: 'AdminUsername', BOT_GROUP_LINK: 'official_channel',
@@ -40,20 +42,14 @@ async function getConfig(): Promise<BotConfig> {
   try {
     const stored = await redis.get<Partial<BotConfig>>('bot:config');
     return { ...DEFAULT_CONFIG, ...(stored || {}) };
-  } catch (e) {
-    return DEFAULT_CONFIG;
-  }
+  } catch (e) { return DEFAULT_CONFIG; }
 }
 
 async function saveConfig(c: BotConfig) { await redis.set('bot:config', c); }
 
-// ─── USER STORE ──────────────────────────────────────────────────────
 async function getUsers(): Promise<Record<string, string>> {
-  try {
-    return (await redis.get<Record<string, string>>('bot:users')) || {};
-  } catch (e) {
-    return {};
-  }
+  try { return (await redis.get<Record<string, string>>('bot:users')) || {}; } 
+  catch (e) { return {}; }
 }
 async function setUsers(u: Record<string, string>) { await redis.set('bot:users', u); }
 
@@ -74,29 +70,17 @@ function listUsers(users: Record<string, string>): string {
   return e.map(([u, x]) => `🧑‍🌾 -> @${u}  (expires ${x})`).join('\n');
 }
 
-// ─── LOGS ────────────────────────────────────────────────────────────
 async function pushLog(text: string, level: LogEntry['level'] = 'info') {
-  const entry: LogEntry = {
-    id: Date.now() + Math.floor(Math.random() * 1000),
-    time: new Date().toISOString().slice(11, 19),
-    level, text: text.trimEnd(),
-  };
-  try {
-    await redis.lpush('bot:logs', JSON.stringify(entry));
-    await redis.ltrim('bot:logs', 0, 199);
-  } catch(e) {}
+  const entry: LogEntry = { id: Date.now() + Math.floor(Math.random() * 1000), time: new Date().toISOString().slice(11, 19), level, text: text.trimEnd() };
+  try { await redis.lpush('bot:logs', JSON.stringify(entry)); await redis.ltrim('bot:logs', 0, 199); } catch(e) {}
 }
 
 async function getLogs(limit = 200): Promise<LogEntry[]> {
-  try {
-    const raw = (await redis.lrange('bot:logs', 0, Math.max(0, limit - 1))) || [];
-    return raw.map(s => (typeof s === 'string' ? JSON.parse(s) : s));
-  } catch(e) { return []; }
+  try { const raw = (await redis.lrange('bot:logs', 0, Math.max(0, limit - 1))) || []; return raw.map(s => (typeof s === 'string' ? JSON.parse(s) : s)); } catch(e) { return []; }
 }
 
 async function clearLogs() { try { await redis.del('bot:logs'); } catch(e){} }
 
-// ─── WINGO ───────────────────────────────────────────────────────────
 const WINGO_URL = 'https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500';
 
 async function fetchWingoHistory(): Promise<WingoRecord[]> {
@@ -132,56 +116,35 @@ function getSize(r: WingoRecord): string {
 }
 
 function predictFromOldest(records: WingoRecord[]): string {
-  if (!records.length)
-    return 'Visionary Bot Prediction 96% Accurate ⭐\n 1 - Minute server\n\n⚠️ No history data available.';
+  if (!records.length) return 'Visionary Bot Prediction 96% Accurate ⭐\n 1 - Minute server\n\n⚠️ No history data available.';
   const o = records[records.length - 1];
-  return (
-    `Visionary Bot Prediction 96% Accurate ⭐\n` +
-    ` 1 - Minute server\n\n` +
-    `Period: ${o.issueNumber || '—'}\n` +
-    `Next Number: ${o.number ?? '—'}\n` +
-    `Next Big/Small: ${getSize(o)}\n` +
-    `Next Color: ${getColourEmoji(o.colour)}`
-  );
+  return `Visionary Bot Prediction 96% Accurate ⭐\n 1 - Minute server\n\nPeriod: ${o.issueNumber || '—'}\nNext Number: ${o.number ?? '—'}\nNext Big/Small: ${getSize(o)}\nNext Color: ${getColourEmoji(o.colour)}`;
 }
 
 function formatTrend(records: WingoRecord[], limit = 10): string {
   let m = '📈 Recent Trend\n💹 Max Rate: 88%\n\n💥💥💥💥💥💥💥💥💥💥\n\n';
   for (const r of records.slice(0, limit)) {
-    m += `🔸Period: <b>${r.issueNumber || '—'}</b>\n🔹Colour: <b>${getColourEmoji(r.colour)}</b>\n` +
-         `🔸Big/Small: <b>${getSize(r)}</b>\n🔹Number: <b>${r.number ?? '—'}</b>\n\n💥💥💥💥💥💥💥💥💥💥\n\n`;
+    m += `🔸Period: <b>${r.issueNumber || '—'}</b>\n🔹Colour: <b>${getColourEmoji(r.colour)}</b>\n🔸Big/Small: <b>${getSize(r)}</b>\n🔹Number: <b>${r.number ?? '—'}</b>\n\n💥💥💥💥💥💥💥💥💥💥\n\n`;
   }
   return m;
 }
 
-// ─── BOT ─────────────────────────────────────────────────────────────
 function isAdmin(c: BotConfig, chatId: number | string): boolean {
   const id = String(chatId);
   return id !== '0' && (id === String(c.ADMIN_ID) || id === String(c.DEV_ID));
 }
 
 async function isJoinedChannel(bot: Telegraf, channel: string, chatId: number): Promise<boolean> {
-  try {
-    const m = await bot.telegram.getChatMember('@' + channel, chatId);
-    return m.status !== 'left';
-  } catch (e) { console.error('[isJoinedChannel]', e); return false; }
+  try { const m = await bot.telegram.getChatMember('@' + channel, chatId); return m.status !== 'left'; } 
+  catch (e) { console.error('[isJoinedChannel]', e); return false; }
 }
 
 async function createBot(config: BotConfig): Promise<Telegraf> {
   const bot = new Telegraf(config.BOT_API_TOKEN);
-  const replyKb = Markup.keyboard([
-    ['📊 Trend Chart', '🎲 Prediction'],
-    ['🛠️ Customer Support', '📢 Main Channel'],
-    ['🔒 Privacy Policy'],
-  ]).resize();
+  const replyKb = Markup.keyboard([['📊 Trend Chart', '🎲 Prediction'], ['🛠️ Customer Support', '📢 Main Channel'], ['🔒 Privacy Policy']]).resize();
 
   bot.start(async (ctx) => {
-    await ctx.reply(
-      `Hi ${ctx.from.first_name} 🌟,\n\nThank you for your interest in ${config.BOT_NAME}! 🤖 To unlock advanced features and exclusive content, ` +
-      `simply subscribe to our official JEMSH Mods channel (https://t.me/${config.BOT_GROUP_LINK}). 🚀\n\n` +
-      `This step is crucial to ensure you're a real person and not a robot. We're excited to welcome you to our VIP community!`,
-      replyKb
-    );
+    await ctx.reply(`Hi ${ctx.from.first_name} 🌟,\n\nThank you for your interest in ${config.BOT_NAME}! 🤖 To unlock advanced features and exclusive content, simply subscribe to our official JEMSH Mods channel (https://t.me/${config.BOT_GROUP_LINK}). 🚀\n\nThis step is crucial to ensure you're a real person and not a robot. We're excited to welcome you to our VIP community!`, replyKb);
   });
 
   bot.command('id', (ctx) => ctx.reply(`Your id: ${ctx.chat.id}`));
@@ -232,15 +195,10 @@ async function createBot(config: BotConfig): Promise<Telegraf> {
     const chatId = ctx.chat.id;
     const username = ctx.from.username;
 
-    if (!username) {
-      return ctx.reply(`❌ You Dont have Username.\nGo to Telegram Settings ⚙️ and Create ➕ your telegram username to use ${config.BOT_NAME}.`);
-    }
+    if (!username) return ctx.reply(`❌ You Dont have Username.\nGo to Telegram Settings ⚙️ and Create ➕ your telegram username to use ${config.BOT_NAME}.`);
 
     if (!(await isJoinedChannel(bot, config.BOT_GROUP_LINK, chatId))) {
-      return ctx.reply(
-        `Hi ${username} 🌟,\n\nSimply subscribe to our official Channel to use ${config.BOT_NAME}.\n Link: https://t.me/${config.BOT_GROUP_LINK} 🚀.\n`,
-        Markup.inlineKeyboard([Markup.button.url('Subscribe Here', `https://t.me/${config.BOT_GROUP_LINK}`)])
-      );
+      return ctx.reply(`Hi ${username} 🌟,\n\nSimply subscribe to our official Channel to use ${config.BOT_NAME}.\n Link: https://t.me/${config.BOT_GROUP_LINK} 🚀.\n`, Markup.inlineKeyboard([Markup.button.url('Subscribe Here', `https://t.me/${config.BOT_GROUP_LINK}`)]));
     }
 
     if (text === '🎲 Prediction') {
@@ -249,17 +207,8 @@ async function createBot(config: BotConfig): Promise<Telegraf> {
         const ph = await ctx.reply('Predicting...'); phId = ph.message_id;
         const vip = isAdmin(config, chatId) || (await isSubscribed(username));
         if (!vip) {
-          const btns = config.PLANS.map(p => Markup.button.url(
-            p.label,
-            `https://t.me/${config.ADMIN_USERNAME}?text=${encodeURIComponent(`Hello Sir, I want to Purchase **${p.label} Plan**. Please Proceed further.`)}`
-          ));
-          await ctx.reply(
-            `🌟 Welcome to ${config.BOT_NAME} Subscription 🌟\n\nUnveil the exceptional benefits awaiting you with our Subscription:\n\n` +
-            `🎯 88% Accuracy Guarantee: Unlock precise predictions with unparalleled precision.\n🏆 Single-Level Wins: Experience victory in just one game.\n` +
-            `🕒 24/7 Availability: Access our services round the clock, from any corner of the globe.\n⚡️ Lightning-Fast Responses: Enjoy rapid solutions and real-time updates.\n\n` +
-            `Embark on your journey to unparalleled success by selecting from the options below to discover our exclusive Subscription features:`,
-            Markup.inlineKeyboard(btns.map(b => [b]))
-          );
+          const btns = config.PLANS.map(p => Markup.button.url(p.label, `https://t.me/${config.ADMIN_USERNAME}?text=${encodeURIComponent(`Hello Sir, I want to Purchase **${p.label} Plan**. Please Proceed further.`)}`));
+          await ctx.reply(`🌟 Welcome to ${config.BOT_NAME} Subscription 🌟\n\nUnveil the exceptional benefits awaiting you with our Subscription:\n\n🎯 88% Accuracy Guarantee: Unlock precise predictions with unparalleled precision.\n🏆 Single-Level Wins: Experience victory in just one game.\n🕒 24/7 Availability: Access our services round the clock, from any corner of the globe.\n⚡️ Lightning-Fast Responses: Enjoy rapid solutions and real-time updates.\n\nEmbark on your journey to unparalleled success by selecting from the options below to discover our exclusive Subscription features:`, Markup.inlineKeyboard(btns.map(b => [b])));
         } else {
           const r = await fetchWingoHistory();
           await ctx.reply(predictFromOldest(r));
@@ -271,47 +220,23 @@ async function createBot(config: BotConfig): Promise<Telegraf> {
         if (phId) { try { await ctx.telegram.deleteMessage(chatId, phId); } catch {} }
       }
     } else if (text === '📊 Trend Chart') {
-      try {
-        const r = await fetchWingoHistory();
-        await ctx.reply(formatTrend(r, 10), { parse_mode: 'HTML' });
-      } catch (e: any) { await ctx.reply('Trend Chart: Oops! 🤖 Something went wrong.'); }
+      try { const r = await fetchWingoHistory(); await ctx.reply(formatTrend(r, 10), { parse_mode: 'HTML' }); } 
+      catch (e: any) { await ctx.reply('Trend Chart: Oops! 🤖 Something went wrong.'); }
     } else if (text === '🛠️ Customer Support') {
-      await ctx.reply(
-        `Dear <b>${ctx.from.first_name} ${ctx.from.last_name || ''}</b>\nIf you encounter any issues or need assistance, feel free to DM me.👇👇`,
-        { parse_mode: 'HTML', ...Markup.inlineKeyboard([Markup.button.url('SUPPORT', `https://t.me/${config.ADMIN_USERNAME}`)]) }
-      );
+      await ctx.reply(`Dear <b>${ctx.from.first_name} ${ctx.from.last_name || ''}</b>\nIf you encounter any issues or need assistance, feel free to DM me.👇👇`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([Markup.button.url('SUPPORT', `https://t.me/${config.ADMIN_USERNAME}`)]) });
     } else if (text === '📢 Main Channel') {
       const name = ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '');
-      await ctx.reply(
-        `Hello Dear <b>${name}</b> you need daily free mod and best accurate prediction you must join our Main Channel 👇👇`,
-        { parse_mode: 'HTML', ...Markup.inlineKeyboard([Markup.button.url('Join Now', `https://t.me/${config.BOT_GROUP_LINK}`)]) }
-      );
+      await ctx.reply(`Hello Dear <b>${name}</b> you need daily free mod and best accurate prediction you must join our Main Channel 👇👇`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([Markup.button.url('Join Now', `https://t.me/${config.BOT_GROUP_LINK}`)]) });
     } else if (text === '🔒 Privacy Policy') {
-      await ctx.reply(
-        `<b>✨ ${config.BOT_NAME} - Privacy Policy ✨</b>\n\n` +
-        `<b>🔰 Legal Consultation</b>: Seek advice from legal professionals specializing in privacy law.\n\n` +
-        `<b>🔰 Data Privacy</b>: Ensure compliance with privacy laws.\n\n` +
-        `<b>🔰 Transparency</b>: Clearly communicate how the bot works.\n\n` +
-        `<b>🔰 Accuracy</b>: Predictions are not legal advice.\n\n` +
-        `<b>🔰 Disclaimers</b>: Predictions are algorithmic and may not be accurate.`,
-        { parse_mode: 'HTML' }
-      );
+      await ctx.reply(`<b>✨ ${config.BOT_NAME} - Privacy Policy ✨</b>\n\n<b>🔰 Legal Consultation</b>: Seek advice from legal professionals specializing in privacy law.\n\n<b>🔰 Data Privacy</b>: Ensure compliance with privacy laws.\n\n<b>🔰 Transparency</b>: Clearly communicate how the bot works.\n\n<b>🔰 Accuracy</b>: Predictions are not legal advice.\n\n<b>🔰 Disclaimers</b>: Predictions are algorithmic and may not be accurate.`, { parse_mode: 'HTML' });
     }
   });
-
   return bot;
 }
 
-// ─── HELPERS ─────────────────────────────────────────────────────────
-function cleanHandle(s: string): string {
-  return String(s || '').replace(/^(https?:\/\/)?(t\.me\/|telegram\.me\/)/, '').replace(/^@/, '').trim();
-}
-function getBaseUrl(req: VercelRequest): string {
-  const h = ((req.headers['x-forwarded-host'] as string) || (req.headers.host as string) || '').split(',')[0].trim();
-  return h ? `https://${h}` : '';
-}
+function cleanHandle(s: string): string { return String(s || '').replace(/^(https?:\/\/)?(t\.me\/|telegram\.me\/)/, '').replace(/^@/, '').trim(); }
+function getBaseUrl(req: VercelRequest): string { const h = ((req.headers['x-forwarded-host'] as string) || (req.headers.host as string) || '').split(',')[0].trim(); return h ? `https://${h}` : ''; }
 
-// ─── INLINE ADMIN DASHBOARD (HTML) ───────────────────────────────────
 const ADMIN_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -368,52 +293,72 @@ const ADMIN_HTML = `<!DOCTYPE html>
 const FIELDS = ['BOT_API_TOKEN','ADMIN_ID','DEV_ID','BOT_NAME','ADMIN_USERNAME','BOT_GROUP_LINK'];
 
 async function refresh() {
+  const statusDiv = document.getElementById('status');
   try {
-    const s = await (await fetch('/api/status')).json();
+    const res = await fetch('/api/status');
+    const text = await res.text();
+    
+    if (!res.ok) {
+      statusDiv.innerHTML = \`<div class="text-red-500 font-bold p-2 bg-red-900/20 rounded border border-red-900/50">API Error (\${res.status}):<br><pre class="text-xs mt-1 whitespace-pre-wrap">\${text}</pre></div>\`;
+      return;
+    }
+    
+    let s;
+    try { s = JSON.parse(text); } catch(e) { throw new Error("Invalid JSON from server"); }
+    
     const color = s.status === 'running' ? 'text-green-400' : s.status === 'waiting_token' ? 'text-yellow-400' : 'text-red-400';
-    document.getElementById('status').innerHTML =
-      \`<div class="flex items-center gap-3">
+    statusDiv.innerHTML = \`<div class="flex items-center gap-3">
         <span class="text-2xl">\${s.status === 'running' ? '🟢' : s.status === 'waiting_token' ? '🟡' : '🔴'}</span>
         <div>
-          <div class="font-semibold \${color}">Status: \${s.status.toUpperCase()}</div>
-          <div class="text-xs text-slate-400">Bot: \${s.botName} · Channel: @\${s.botGroupLink} · Webhook: \${s.webhookUrl || 'not registered'}</div>
+          <div class="font-semibold \${color}">Status: \${s.status ? s.status.toUpperCase() : 'UNKNOWN'}</div>
+          <div class="text-xs text-slate-400">Bot: \${s.botName || '—'} · Channel: @\${s.botGroupLink || '—'} · Webhook: \${s.webhookUrl || 'not registered'}</div>
         </div>
       </div>\`;
 
-    const c = await (await fetch('/api/config')).json();
+    const cRes = await fetch('/api/config');
+    const c = await cRes.json();
     const form = document.getElementById('cfgForm');
     FIELDS.forEach(k => { if (form[k]) form[k].value = c[k] || ''; });
 
-    const u = await (await fetch('/api/users')).json();
-    document.getElementById('users').innerHTML = u.users.length
+    const uRes = await fetch('/api/users');
+    const u = await uRes.json();
+    document.getElementById('users').innerHTML = (u.users && u.users.length)
       ? u.users.map(x => \`<div class="flex justify-between items-center py-1 border-b border-slate-800">
           <span>@\${x.username} · expires \${x.expiration} (\${x.daysLeft}d)</span>
           <button onclick="removeUser('\${x.username}')" class="text-red-400 hover:text-red-300 text-sm">Remove</button>
         </div>\`).join('')
       : '<div class="text-slate-500">No VIP users yet</div>';
 
-    const l = await (await fetch('/api/logs?limit=50')).json();
-    document.getElementById('logs').innerHTML = l.logs.reverse()
-      .map(e => \`<div class="\${e.level === 'error' ? 'text-red-400' : e.level === 'success' ? 'text-green-400' : e.level === 'warn' ? 'text-yellow-400' : 'text-slate-300'}">
+    const lRes = await fetch('/api/logs?limit=50');
+    const l = await lRes.json();
+    document.getElementById('logs').innerHTML = (l.logs && l.logs.length)
+      ? l.logs.slice().reverse().map(e => \`<div class="\${e.level === 'error' ? 'text-red-400' : e.level === 'success' ? 'text-green-400' : e.level === 'warn' ? 'text-yellow-400' : 'text-slate-300'}">
         <span class="text-slate-500">[\${e.time}]</span> \${e.text}
-      </div>\`).join('') || '<div class="text-slate-500">No logs yet</div>';
-  } catch (e) { console.error(e); }
+      </div>\`).join('')
+      : '<div class="text-slate-500">No logs yet</div>';
+  } catch (e) {
+    statusDiv.innerHTML = \`<div class="text-red-500 font-bold p-2 bg-red-900/20 rounded border border-red-900/50">Network Error: \${e.message}</div>\`;
+  }
 }
 
 document.getElementById('cfgForm').onsubmit = async (e) => {
   e.preventDefault();
-  const data = {};
-  FIELDS.forEach(k => { data[k] = e.target[k].value; });
-  const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
-  const j = await r.json();
-  alert(j.success ? 'Saved! Webhook registered. Bot is now live.' : 'Error: ' + (j.error || 'unknown'));
+  const btn = e.target.querySelector('button');
+  btn.innerText = 'Saving...';
+  try {
+    const data = {};
+    FIELDS.forEach(k => { data[k] = e.target[k].value; });
+    const r = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    const j = await r.json();
+    alert(j.success ? 'Saved! Webhook registered. Bot is now live.' : 'Error: ' + (j.error || 'unknown'));
+  } catch(e) { alert('Network Error: ' + e.message); }
+  btn.innerText = '💾 Save & Register Webhook';
   refresh();
 };
 
 document.getElementById('addForm').onsubmit = async (e) => {
   e.preventDefault();
-  await fetch('/api/users/add', { method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ username: e.target.username.value, days: e.target.days.value }) });
+  await fetch('/api/users/add', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username: e.target.username.value, days: e.target.days.value }) });
   e.target.reset();
   refresh();
 };
@@ -424,10 +369,7 @@ async function removeUser(u) {
   refresh();
 }
 
-async function clearLogs() {
-  await fetch('/api/logs', { method: 'POST' });
-  refresh();
-}
+async function clearLogs() { await fetch('/api/logs', { method: 'POST' }); refresh(); }
 
 refresh();
 setInterval(refresh, 5000);
@@ -435,7 +377,6 @@ setInterval(refresh, 5000);
 </body>
 </html>`;
 
-// ─── MAIN HANDLER ────────────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const raw = req.query.path;
   const segments: string[] = Array.isArray(raw) ? raw.map(String) : typeof raw === 'string' ? [raw] : [];
@@ -450,10 +391,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (route === 'webhook') {
       if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
       const config = await getConfig();
-      if (!config.BOT_API_TOKEN) {
-        await pushLog('Webhook called but BOT_API_TOKEN is not configured', 'warn');
-        return res.status(500).send('Bot token not configured');
-      }
+      if (!config.BOT_API_TOKEN) return res.status(500).send('Bot token not configured');
       const bot = await createBot(config);
       await bot.handleUpdate(req.body);
       return res.status(200).send('ok');
@@ -464,47 +402,31 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const isConfigured = Boolean(config.BOT_API_TOKEN && config.BOT_API_TOKEN.length > 15);
       let webhookUrl: string | null = null;
       if (isConfigured) {
-        try {
-          const r = await fetch(`https://api.telegram.org/bot${config.BOT_API_TOKEN}/getWebhookInfo`);
-          const d: any = await r.json();
-          webhookUrl = d?.result?.url || null;
-        } catch {}
+        try { const r = await fetch(\`https://api.telegram.org/bot\${config.BOT_API_TOKEN}/getWebhookInfo\`); const d: any = await r.json(); webhookUrl = d?.result?.url || null; } catch {}
       }
-      return res.json({
-        status: webhookUrl ? 'running' : isConfigured ? 'starting' : 'waiting_token',
-        isConfigured, botName: config.BOT_NAME,
-        adminUsername: config.ADMIN_USERNAME, botGroupLink: config.BOT_GROUP_LINK, webhookUrl,
-      });
+      return res.json({ status: webhookUrl ? 'running' : isConfigured ? 'starting' : 'waiting_token', isConfigured, botName: config.BOT_NAME, adminUsername: config.ADMIN_USERNAME, botGroupLink: config.BOT_GROUP_LINK, webhookUrl });
     }
 
     if (route === 'config') {
       if (req.method === 'GET') {
         const c = await getConfig();
-        const tokenPreview = c.BOT_API_TOKEN ? `${c.BOT_API_TOKEN.slice(0, 6)}...${c.BOT_API_TOKEN.slice(-4)}` : '';
+        const tokenPreview = c.BOT_API_TOKEN ? \`\${c.BOT_API_TOKEN.slice(0, 6)}...\${c.BOT_API_TOKEN.slice(-4)}\` : '';
         return res.json({ ...c, tokenPreview });
       }
       if (req.method === 'POST') {
         const body = req.body || {};
         const current = await getConfig();
-        const updated: BotConfig = {
-          ...current, ...body,
-          ADMIN_USERNAME: cleanHandle(body.ADMIN_USERNAME || current.ADMIN_USERNAME),
-          BOT_GROUP_LINK: cleanHandle(body.BOT_GROUP_LINK || current.BOT_GROUP_LINK),
-        };
+        const updated: BotConfig = { ...current, ...body, ADMIN_USERNAME: cleanHandle(body.ADMIN_USERNAME || current.ADMIN_USERNAME), BOT_GROUP_LINK: cleanHandle(body.BOT_GROUP_LINK || current.BOT_GROUP_LINK) };
         await saveConfig(updated);
         await pushLog('Bot configuration updated from Web Dashboard.', 'success');
-
         if (updated.BOT_API_TOKEN) {
-          const webhookUrl = `${getBaseUrl(req)}/api/webhook`;
+          const webhookUrl = \`\${getBaseUrl(req)}/api/webhook\`;
           try {
-            const resp = await fetch(`https://api.telegram.org/bot${updated.BOT_API_TOKEN}/setWebhook`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ url: webhookUrl }),
-            });
+            const resp = await fetch(\`https://api.telegram.org/bot\${updated.BOT_API_TOKEN}/setWebhook\`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: webhookUrl }) });
             const result: any = await resp.json();
-            if (result.ok) await pushLog(`Webhook registered: ${webhookUrl}`, 'success');
-            else await pushLog(`setWebhook failed: ${result.description}`, 'error');
-          } catch (e: any) { await pushLog(`setWebhook error: ${e.message}`, 'error'); }
+            if (result.ok) await pushLog(\`Webhook registered: \${webhookUrl}\`, 'success');
+            else await pushLog(\`setWebhook failed: \${result.description}\`, 'error');
+          } catch (e: any) { await pushLog(\`setWebhook error: \${e.message}\`, 'error'); }
         }
         return res.json({ success: true, config: updated });
       }
@@ -514,17 +436,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (route === 'users' && req.method === 'GET') {
       const users = await getUsers();
       const now = new Date(); now.setUTCHours(0, 0, 0, 0);
-      return res.json({
-        users: Object.entries(users).map(([username, expiration]) => {
-          const exp = new Date(expiration + 'T00:00:00Z');
-          const daysLeft = Math.ceil((exp.getTime() - now.getTime()) / 86_400_000);
-          return { username, expiration, daysLeft: Math.max(0, daysLeft), isActive: daysLeft >= 0 };
-        }),
-      });
+      return res.json({ users: Object.entries(users).map(([username, expiration]) => { const exp = new Date(expiration + 'T00:00:00Z'); const daysLeft = Math.ceil((exp.getTime() - now.getTime()) / 86400000); return { username, expiration, daysLeft: Math.max(0, daysLeft), isActive: daysLeft >= 0 }; }) });
     }
 
-    if (route === 'users/add') {
-      if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+    if (route === 'users/add' && req.method === 'POST') {
       const { username, days } = req.body || {};
       if (!username || !days) return res.status(400).json({ error: 'username and days required' });
       const cleanUser = String(username).toLowerCase().replace(/^@/, '').trim();
@@ -533,68 +448,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const exp = new Date(); exp.setDate(exp.getDate() + numDays);
       const expStr = exp.toISOString().split('T')[0];
       const users = await getUsers(); users[cleanUser] = expStr; await setUsers(users);
-      await pushLog(`VIP Manager: added @${cleanUser} for ${numDays} days (until ${expStr})`, 'success');
+      await pushLog(\`VIP Manager: added @\${cleanUser} for \${numDays} days\`, 'success');
       return res.json({ success: true, username: cleanUser, expiration: expStr });
     }
 
-    if (route === 'users/remove') {
-      if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+    if (route === 'users/remove' && req.method === 'POST') {
       const { username } = req.body || {};
       if (!username) return res.status(400).json({ error: 'username required' });
       const cleanUser = String(username).toLowerCase().replace(/^@/, '').trim();
       const users = await getUsers(); delete users[cleanUser]; await setUsers(users);
-      await pushLog(`VIP Manager: removed @${cleanUser}`, 'info');
+      await pushLog(\`VIP Manager: removed @\${cleanUser}\`, 'info');
       return res.json({ success: true });
     }
 
     if (route === 'logs') {
       if (req.method === 'GET') return res.json({ logs: await getLogs(parseInt(String(req.query.limit || '200'), 10)) });
-      if (req.method === 'POST') {
-        await clearLogs();
-        await pushLog('Console logs cleared by user.', 'info');
-        return res.json({ success: true });
-      }
+      if (req.method === 'POST') { await clearLogs(); await pushLog('Console logs cleared by user.', 'info'); return res.json({ success: true }); }
       return res.status(405).json({ error: 'Method not allowed' });
-    }
-
-    if (route === 'logs/stream') {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('X-Accel-Buffering', 'no');
-      for (const e of (await getLogs(50)).reverse()) res.write(`data: ${JSON.stringify(e)}\n\n`);
-      return res.end();
-    }
-
-    if (route.startsWith('bot/')) {
-      if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-      const action = route.slice(4);
-      const config = await getConfig();
-      if (!config.BOT_API_TOKEN) return res.status(400).json({ error: 'BOT_API_TOKEN not configured' });
-
-      if (action === 'start' || action === 'restart') {
-        const webhookUrl = `${getBaseUrl(req)}/api/webhook`;
-        const resp = await fetch(`https://api.telegram.org/bot${config.BOT_API_TOKEN}/setWebhook`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: webhookUrl }),
-        });
-        const result: any = await resp.json();
-        if (!result.ok) throw new Error(result.description || 'setWebhook failed');
-        await pushLog(`Bot ${action}: webhook registered at ${webhookUrl}`, 'success');
-        return res.json({ success: true, status: 'running', webhookUrl });
-      }
-      if (action === 'stop') {
-        await fetch(`https://api.telegram.org/bot${config.BOT_API_TOKEN}/deleteWebhook`);
-        await pushLog('Bot stopped: webhook deleted', 'info');
-        return res.json({ success: true, status: 'stopped' });
-      }
-      return res.status(400).json({ error: 'Unknown action' });
     }
 
     if (route === 'telegram/verify') {
       const config = await getConfig();
       const token = (req.query.token as string) || config.BOT_API_TOKEN;
       if (!token || !token.includes(':')) return res.status(400).json({ valid: false, message: 'Invalid token' });
-      const r = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+      const r = await fetch(\`https://api.telegram.org/bot\${token}/getMe\`);
       const d: any = await r.json();
       return d.ok ? res.json({ valid: true, bot: d.result }) : res.json({ valid: false, error: d.description });
     }
@@ -602,61 +479,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (route === 'wingo/history') {
       const records = await fetchWingoHistory();
       let prediction: any = null;
-      if (records.length) {
-        const o = records[records.length - 1]; const n = records[0];
-        prediction = {
-          targetPeriod: n.issueNumber ? String(BigInt(n.issueNumber) + 1n) : 'Next Round',
-          referencePeriod: o.issueNumber, predictedNumber: o.number,
-          predictedSize: getSize(o), predictedColour: getColourEmoji(o.colour),
-          rawColour: o.colour, confidence: '96%', server: '1 - Minute Server',
-        };
-      }
+      if (records.length) { const o = records[records.length - 1]; const n = records[0]; prediction = { targetPeriod: n.issueNumber ? String(BigInt(n.issueNumber) + 1n) : 'Next Round', referencePeriod: o.issueNumber, predictedNumber: o.number, predictedSize: getSize(o), predictedColour: getColourEmoji(o.colour), rawColour: o.colour, confidence: '96%', server: '1 - Minute Server' }; }
       return res.json({ total: records.length, latest: records[0] || null, prediction, records: records.slice(0, 50) });
     }
 
-    if (route === 'simulate') {
-      if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-      const { text, username = 'trader_demo', chatId = '999888777', isAdmin: simAdmin = false } = req.body || {};
-      const config = await getConfig();
-      const input = String(text || '').trim();
-      const users = await getUsers();
-      let isSub = false;
-      const exp = users[String(username).toLowerCase()];
-      if (exp) { const now = new Date(); now.setUTCHours(0, 0, 0, 0); isSub = new Date(exp + 'T00:00:00Z') >= now; }
-
-      if (input === '/start') return res.json({
-        reply: `Hi ${username} 🌟,\n\nThank you for your interest in ${config.BOT_NAME}! 🤖`,
-        replyMarkup: ['📊 Trend Chart', '🎲 Prediction', '🛠️ Customer Support', '📢 Main Channel', '🔒 Privacy Policy'],
-      });
-      if (input === '/id') return res.json({ reply: `Your Telegram User ID: <code>${chatId}</code>` });
-      if (input === '📊 Trend Chart') return res.json({ reply: formatTrend(await fetchWingoHistory(), 10) });
-      if (input === '🎲 Prediction') {
-        if (simAdmin || isSub) return res.json({ reply: predictFromOldest(await fetchWingoHistory()), isVip: true });
-        return res.json({
-          reply: `🌟 Welcome to ${config.BOT_NAME} Subscription 🌟\n\nChoose a plan to continue:`,
-          buttons: config.PLANS.map(p => ({ text: p.label, url: `https://t.me/${config.ADMIN_USERNAME}?text=${encodeURIComponent(`I want **${p.label}**`)}` })),
-          isVip: false,
-        });
-      }
-      if (input.startsWith('/add')) {
-        if (!simAdmin) return res.json({ reply: '⛔ Not authorized.' });
-        const p = input.split(/\s+/);
-        if (p.length < 3) return res.json({ reply: 'Usage: /add <username> <duration>' });
-        const u = p[1].replace(/^@/, '').toLowerCase();
-        const days = parseInt(p[2].replace(/[dD]/, ''), 10);
-        if (isNaN(days) || days <= 0) return res.json({ reply: 'Duration must be positive.' });
-        const e = new Date(); e.setDate(e.getDate() + days);
-        const expStr = e.toISOString().split('T')[0];
-        const all = await getUsers(); all[u] = expStr; await setUsers(all);
-        return res.json({ reply: `User added Successfully.\n\nUsers After Modified:\n${listUsers(all)}` });
-      }
-      return res.json({ reply: `Received: "${input}"` });
-    }
-
-    return res.status(404).json({ error: `Unknown route: /api/${route}` });
+    return res.status(404).json({ error: \`Unknown route: /api/\${route}\` });
   } catch (e: any) {
     console.error('[api]', e);
-    await pushLog(`API error on /api/${route}: ${e.message}`, 'error');
     return res.status(500).json({ error: e.message });
   }
 }
