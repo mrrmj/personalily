@@ -1,24 +1,13 @@
 // =====================================================================
 // Visionary Bot — SINGLE FILE (all logic + inline admin dashboard)
-// Routes (all handled here):
-//   GET  /                          → admin dashboard HTML
-//   POST /api/webhook               → Telegram updates
-//   GET  /api/status                → bot status
-//   GET/POST /api/config            → bot config
-//   GET  /api/users                 → list VIP
-//   POST /api/users/add             → add VIP
-//   POST /api/users/remove          → remove VIP
-//   GET/POST /api/logs              → read/clear logs
-//   GET  /api/logs/stream           → SSE logs
-//   POST /api/bot/start|stop|restart→ webhook control
-//   GET  /api/telegram/verify       → token check
-//   GET  /api/wingo/history         → live Wingo + prediction
-//   POST /api/simulate              → chat simulator
 // =====================================================================
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { Telegraf, Markup } from 'telegraf';
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
+
+// Initialize the new Upstash Redis connection
+const redis = Redis.fromEnv();
 
 // ─── TYPES ───────────────────────────────────────────────────────────
 interface Plan { label: string; price: string; days: number; }
@@ -48,17 +37,25 @@ const DEFAULT_CONFIG: BotConfig = {
 };
 
 async function getConfig(): Promise<BotConfig> {
-  const stored = await kv.get<Partial<BotConfig>>('bot:config');
-  return { ...DEFAULT_CONFIG, ...(stored || {}) };
+  try {
+    const stored = await redis.get<Partial<BotConfig>>('bot:config');
+    return { ...DEFAULT_CONFIG, ...(stored || {}) };
+  } catch (e) {
+    return DEFAULT_CONFIG;
+  }
 }
 
-async function saveConfig(c: BotConfig) { await kv.set('bot:config', c); }
+async function saveConfig(c: BotConfig) { await redis.set('bot:config', c); }
 
 // ─── USER STORE ──────────────────────────────────────────────────────
 async function getUsers(): Promise<Record<string, string>> {
-  return (await kv.get<Record<string, string>>('bot:users')) || {};
+  try {
+    return (await redis.get<Record<string, string>>('bot:users')) || {};
+  } catch (e) {
+    return {};
+  }
 }
-async function setUsers(u: Record<string, string>) { await kv.set('bot:users', u); }
+async function setUsers(u: Record<string, string>) { await redis.set('bot:users', u); }
 
 async function isSubscribed(username: string): Promise<boolean> {
   const users = await getUsers();
@@ -84,16 +81,20 @@ async function pushLog(text: string, level: LogEntry['level'] = 'info') {
     time: new Date().toISOString().slice(11, 19),
     level, text: text.trimEnd(),
   };
-  await kv.lpush('bot:logs', JSON.stringify(entry));
-  await kv.ltrim('bot:logs', 0, 199);
+  try {
+    await redis.lpush('bot:logs', JSON.stringify(entry));
+    await redis.ltrim('bot:logs', 0, 199);
+  } catch(e) {}
 }
 
 async function getLogs(limit = 200): Promise<LogEntry[]> {
-  const raw = (await kv.lrange<string[]>('bot:logs', 0, Math.max(0, limit - 1))) || [];
-  return raw.map(s => (typeof s === 'string' ? JSON.parse(s) : s));
+  try {
+    const raw = (await redis.lrange('bot:logs', 0, Math.max(0, limit - 1))) || [];
+    return raw.map(s => (typeof s === 'string' ? JSON.parse(s) : s));
+  } catch(e) { return []; }
 }
 
-async function clearLogs() { await kv.del('bot:logs'); }
+async function clearLogs() { try { await redis.del('bot:logs'); } catch(e){} }
 
 // ─── WINGO ───────────────────────────────────────────────────────────
 const WINGO_URL = 'https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-500';
@@ -441,13 +442,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const route = segments.join('/');
 
   try {
-    // Serve admin dashboard for `/`, `/dashboard`, `/render`, and any non-API path
     if (route === 'render' || route === '' || route === 'index') {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       return res.send(ADMIN_HTML);
     }
 
-    // POST /api/webhook
     if (route === 'webhook') {
       if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
       const config = await getConfig();
@@ -460,7 +459,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).send('ok');
     }
 
-    // GET /api/status
     if (route === 'status') {
       const config = await getConfig();
       const isConfigured = Boolean(config.BOT_API_TOKEN && config.BOT_API_TOKEN.length > 15);
@@ -479,7 +477,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // GET/POST /api/config
     if (route === 'config') {
       if (req.method === 'GET') {
         const c = await getConfig();
@@ -514,7 +511,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    // GET /api/users
     if (route === 'users' && req.method === 'GET') {
       const users = await getUsers();
       const now = new Date(); now.setUTCHours(0, 0, 0, 0);
@@ -527,7 +523,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    // POST /api/users/add
     if (route === 'users/add') {
       if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
       const { username, days } = req.body || {};
@@ -542,7 +537,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.json({ success: true, username: cleanUser, expiration: expStr });
     }
 
-    // POST /api/users/remove
     if (route === 'users/remove') {
       if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
       const { username } = req.body || {};
@@ -553,7 +547,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.json({ success: true });
     }
 
-    // GET/POST /api/logs
     if (route === 'logs') {
       if (req.method === 'GET') return res.json({ logs: await getLogs(parseInt(String(req.query.limit || '200'), 10)) });
       if (req.method === 'POST') {
@@ -564,7 +557,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    // GET /api/logs/stream
     if (route === 'logs/stream') {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -573,7 +565,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.end();
     }
 
-    // POST /api/bot/start|stop|restart
     if (route.startsWith('bot/')) {
       if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
       const action = route.slice(4);
@@ -599,7 +590,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(400).json({ error: 'Unknown action' });
     }
 
-    // GET /api/telegram/verify
     if (route === 'telegram/verify') {
       const config = await getConfig();
       const token = (req.query.token as string) || config.BOT_API_TOKEN;
@@ -609,7 +599,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return d.ok ? res.json({ valid: true, bot: d.result }) : res.json({ valid: false, error: d.description });
     }
 
-    // GET /api/wingo/history
     if (route === 'wingo/history') {
       const records = await fetchWingoHistory();
       let prediction: any = null;
@@ -625,7 +614,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.json({ total: records.length, latest: records[0] || null, prediction, records: records.slice(0, 50) });
     }
 
-    // POST /api/simulate
     if (route === 'simulate') {
       if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
       const { text, username = 'trader_demo', chatId = '999888777', isAdmin: simAdmin = false } = req.body || {};
